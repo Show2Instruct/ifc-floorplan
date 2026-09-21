@@ -1,0 +1,4 @@
+ifcopenshell>=0.8.5
+shapely>=2.1
+numpy>=2.0
+networkx>=3.0
