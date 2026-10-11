@@ -8,18 +8,62 @@ from fp.extract import footprint, NON_FABRIC
 # Columns bound a room as firmly as a wall does. Leave them out and rooms leak through the
 # gaps between curtain-wall panels, and frames that define rooms with columns produce nothing.
 BARRIERS = ('IfcWall', 'IfcCurtainWall', 'IfcDoor', 'IfcWindow', 'IfcPlate', 'IfcColumn')
-MIN_CUT_M = .3          # below this, a section describes the level above more than this one
-EMPTY_STATUSES = {'outside_band', 'boundary_contact_no_area', 'empty_geometry'}
+MIN_CUT_M = .3          # below this a section says more about the level above than this one
+# Storeys nearer than this are one physical level: a floor listed twice, or a structural or datum
+# level a few centimetres to a few decimetres from the floor it belongs to. It is twice MIN_CUT_M,
+# the gap below which the lower record could never be cut anyway.
+SAME_LEVEL_M = 2 * MIN_CUT_M
+
+
+def level_clusters(storeys, same_level=SAME_LEVEL_M):
+    """Storey indices grouped into physical levels, lowest first."""
+    order = sorted(range(len(storeys)), key=lambda i: storeys[i]['elevation_m'])
+    clusters, current = [], []
+    for index in order:
+        if current and storeys[index]['elevation_m'] - storeys[current[-1]]['elevation_m'] >= same_level:
+            clusters.append(current)
+            current = []
+        current.append(index)
+    if current:
+        clusters.append(current)
+    return clusters
+EMPTY_STATUSES = {'outside_band', 'boundary_contact_no_area', 'empty_geometry', 'empty_band'}
+
+
+def section_quality(section):
+    """A storey's section in a form consumers can filter on.
+
+        It describes the cut, not how accurate the rooms are.
+    """
+    reasons = []
+    if section.get('status') == 'no_section_band':
+        return {'status': 'unavailable', 'reasons': [section.get('reason', 'no_section_band')]}
+    if not section.get('barriers_complete', False):
+        reasons.append('excluded_room_barriers')
+    if any(f.get('affects_room_barrier') for f in section.get('fallbacks', [])):
+        reasons.append('full_height_barrier_substitution')
+    if section.get('planar_surface_approximations'):
+        reasons.append('nominal_thickness_planar_surfaces')
+    return {'status': 'partial' if 'excluded_room_barriers' in reasons else
+            'approximate' if reasons else 'sectioned', 'reasons': reasons}
 
 
 def barrier_roles(data, classes=BARRIERS):
-    """Assembly parts inherit their parent's barrier role through IFC aggregation."""
+    """Assembly parts inherit their parent's barrier role through IFC aggregation.
+
+    Whatever the file says fills an opening is a barrier too, whatever its class: a lift door
+    modelled as a proxy closes its doorway as a door would.
+    """
     by_id = {e['step_id']: e for e in data['elements']}
     children = {}
+    fills = set()
     for relation in data.get('relations', []):
         if relation['type'] == 'part_of':
             children.setdefault(relation['target'], []).append(relation['source'])
+        elif relation['type'] == 'hosts':
+            fills.add(relation['target'])
     roles = {sid for sid, e in by_id.items() if e['ifc_class'].startswith(tuple(classes))}
+    roles |= {sid for sid in fills if sid in by_id and by_id[sid]['ifc_class'] not in NON_FABRIC}
     pending = list(roles)
     while pending:
         parent = pending.pop()
@@ -47,20 +91,26 @@ def full_footprints(data, assignments):
 
 
 def section_band(storeys, index, cut_height, cut_thickness, *, band_base=None, min_cut=MIN_CUT_M):
-    """Where to cut this storey's plan, kept below the next declared level.
+    """Where to cut this storey's plan, kept below the next physical level.
 
-    A plan is normally cut about 1.2 m above the floor. Structural and datum levels break that:
-    where they stand a few centimetres apart, a 1.2 m cut reads the storey above and reports its
-    rooms on a level holding only beams. The cut then drops to the middle of the gap, and where
-    that leaves too little height the storey gets no section instead of a copy of the level above.
+        A plan is normally cut about 1.2 m above the floor. Where the next level is close, the cut drops
+        to the middle of the gap, and where that leaves too little height the storey gets no section
+        instead of a copy of the level above. Levels nearer than SAME_LEVEL_M are one physical level,
+        so the cut is measured to the level beyond them.
 
-    With `band_base` the barriers come from everything between that height and the cut, rather
-    than from a thin slice at it.
+        With `band_base` the barriers come from everything between that height and the cut, rather
+        than from a thin slice at it.
 
-    Returns (low, high, cut height above the storey, note).
+        Returns (low, high, cut height above the storey, note).
     """
     elevation = storeys[index]['elevation_m']
-    gap = storeys[index + 1]['elevation_m'] - elevation if index + 1 < len(storeys) else None
+    # The height available is the distance to the next physical level, not to the next record. A
+    # file can list a floor twice, or put a beam level 40 cm above it, and reading that as the
+    # ceiling left the floor that holds the rooms and doors with no section at all.
+    level = next(c for c in level_clusters(storeys) if index in c)
+    above = [s['elevation_m'] for i, s in enumerate(storeys)
+             if i not in level and s['elevation_m'] > elevation]
+    gap = min(above) - elevation if above else None
     note, top = None, cut_height
     if gap is not None and gap <= cut_height + cut_thickness:
         top = gap / 2
@@ -121,11 +171,13 @@ def section_elements(data, assignments, index, *, cut_height=1.2, cut_thickness=
         if poly is None:
             if info['status'] in EMPTY_STATUSES:
                 continue
-            # A barrier the projector cannot rebuild must not leave a hole in the wall it fills,
-            # or the rooms on both sides drain into one another. Where it belongs to this storey,
-            # its whole-element silhouette stands in and is recorded as a fallback.
+            # A barrier the projector cannot rebuild must not leave a hole in the wall it fills, or the
+            # rooms on both sides drain into one another. Where it belongs to this storey, its
+            # whole-element silhouette stands in and is recorded as a fallback. So does a barrier
+            # of another storey that the band passes through, a wall standing through several
+            # floors for instance: its plan outline is the same at every height it reaches.
             silhouette = element.get('_poly')
-            if owner == index and silhouette is not None:
+            if (owner == index or is_barrier) and silhouette is not None:
                 counts['full_height_fallback'] += 1
                 fallbacks.append({'step_id': element['step_id'], 'ifc_class': cls,
                                   'owner_storey_index': owner, 'projection': info,
@@ -158,4 +210,8 @@ def section_elements(data, assignments, index, *, cut_height=1.2, cut_thickness=
                   'available_barrier_meshes_projected': not any(e['affects_room_barrier']
                       and e['projection']['status'] != 'missing_mesh' for e in exclusions),
                   'barriers_complete': not any(e['affects_room_barrier'] for e in exclusions)}
+    diagnostic['planar_surface_approximations'] = [e['step_id'] for e in visible
+        if e['section_projection'].get('approximation')]
+    diagnostic['orientation_repairs'] = [e['step_id'] for e in visible
+        if e['section_projection'].get('orientation_repair')]
     return visible, diagnostic

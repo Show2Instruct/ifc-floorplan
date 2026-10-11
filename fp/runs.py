@@ -85,6 +85,8 @@ def input_arguments(parser):
     parser.add_argument("--out", type=Path,
                         help="new, empty output directory (default results/runs/<operation>-<time>)")
     parser.add_argument("--threads", type=int, default=4, help="IFC geometry threads (default 4)")
+    parser.add_argument('--workers', type=int, default=1,
+                        help='independent model processes (default 1); budget workers × threads for CPU use')
     parser.add_argument("--cell", type=float, default=0.12,
                         help="room raster cell size in metres (default 0.12)")
     parser.add_argument("--min-room-area", type=float, default=1.5,
@@ -197,6 +199,8 @@ def settings(args):
 
 
 def start_run(args, operation, command=None):
+    if getattr(args, 'workers', 1) < 1:
+        raise ValueError('--workers must be positive')
     dataset = dataset_label(args)
     chosen = select_inputs(args)
     config = settings(args)
@@ -222,6 +226,7 @@ def start_run(args, operation, command=None):
     record = {"format_version": 1, "run_id": f"{operation}-{stamp}", "operation": operation,
               "status": "running", "started_utc": utc(), "finished_utc": None,
               "dataset": dataset, "command": command or [sys.executable, *sys.argv],
+              'execution_workers': getattr(args, 'workers', 1),
               "output_dir": str(out.relative_to(root)), "settings": config, "inputs": chosen,
               "code_sha256": code_id, "source_files": fingerprints,
               "source_archive_sha256": sha256(out / "source.zip"),
@@ -230,6 +235,96 @@ def start_run(args, operation, command=None):
               "models": [], "failures": []}
     atomic_json(out / "run.json", record)
     return out, record
+
+
+def _execute_model(job):
+    """One isolated model; only its own artifact directory is writable here."""
+    import time
+    import traceback
+    root, out, operation, config, entry, provenance, include_ineligible = job
+    model = entry['model']
+    row = {'model': model, 'input_ifc': entry['path']}
+    if entry.get('quality_flags'):
+        row['quality_flags'] = entry['quality_flags']
+    if entry.get('eligible') is False and not include_ineligible:
+        row.update(status='skipped', reason='manifest marks this model ineligible')
+        return row, None, None
+    start = time.monotonic()
+    row['started_utc'] = utc()
+    try:
+        if operation == 'floorplans':
+            from fp.build import build
+            from fp.run_pipeline import summarise
+            result = build(model, ifc_path=str(Path(root)/entry['path']),
+                out_dir=str(Path(out)/'models'/model), verbose=False,
+                threads=config['threads'], cell=config['cell'], min_room_area=config['min_room_area'],
+                erode=config['erode'], cut_height=config['cut_height'], cut_thickness=config['cut_thickness'],
+                band_base=config.get('band_base'), barrier_classes=tuple(config['barrier_classes']),
+                provenance=provenance)
+            if result is None:
+                raise ValueError('no storeys found; nothing written')
+            row.update(output_dir=f'models/{model}', **summarise(result))
+            result = None
+        elif operation == 'validation':
+            from fp.validate import validate
+            result = validate(Path(root)/entry['path'], config)
+            if result is None:
+                raise ValueError('no storeys found; nothing validated')
+        else:
+            raise ValueError(f'unsupported model operation: {operation}')
+        row.update(status='completed', elapsed_s=round(time.monotonic()-start, 2))
+        return row, None, result
+    except Exception as exc:
+        message = f'{type(exc).__name__}: {exc}'
+        row.update(status='failed', error=message, elapsed_s=round(time.monotonic()-start, 2))
+        if operation == 'floorplans':
+            row['partial_output'] = (Path(out)/'models'/model).exists()
+        return row, {'model': model, 'error': message,
+                     'traceback_tail': traceback.format_exc().strip().splitlines()[-4:]}, None
+
+
+def model_results(out, record, *, include_ineligible=False):
+    """Run models with bounded CPU processes; only the parent writes run.json.
+
+    Execution concurrency is recorded separately from geometric settings, so
+    identical inputs/settings still give identical model artifacts at any worker count.
+    """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    import multiprocessing
+    jobs = [(str(ROOT), str(out), record['operation'], record['settings'], entry,
+             model_provenance(record, entry), include_ineligible) for entry in record['inputs']]
+    workers = record.get('execution_workers', 1)
+    executor = None
+    if workers == 1:
+        results = map(_execute_model, jobs)
+    else:
+        executor = ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context('spawn'))
+        futures = {executor.submit(_execute_model, job): job for job in jobs}
+
+        def completed():
+            for future in as_completed(futures):
+                try:
+                    yield future.result()
+                except Exception as exc:
+                    entry = futures[future][4]
+                    message = f'worker process failed: {type(exc).__name__}: {exc}'
+                    yield ({'model': entry['model'], 'input_ifc': entry['path'], 'status': 'failed',
+                            'error': message}, {'model': entry['model'], 'error': message}, None)
+        results = completed()
+    try:
+        for row, failure, result in results:
+            record['models'].append(row)
+            record['models'].sort(key=lambda r: r['model'])
+            if failure:
+                record['failures'].append(failure)
+                record['failures'].sort(key=lambda r: r['model'])
+            atomic_json(out/'run.json', record)
+            print(f"  [{len(record['models'])}/{len(jobs)}] {row['model']}: {row['status']} "
+                  f"({row.get('elapsed_s', 0)}s) {row.get('error', '')}", flush=True)
+            yield row, result
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
 
 
 def model_provenance(run, entry):

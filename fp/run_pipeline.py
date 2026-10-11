@@ -69,48 +69,8 @@ def main(argv=None):
     except (ValueError, OSError) as ex:
         ap.error(str(ex))
 
-    cfg, selected = record["settings"], record["inputs"]
-    for n, entry in enumerate(selected, 1):
-        model = entry["model"]
-        row = {"model": model, "input_ifc": entry["path"]}
-        if entry.get("quality_flags"):
-            row["quality_flags"] = entry["quality_flags"]
-        if entry.get("eligible") is False and not args.include_ineligible:
-            row.update(status="skipped", reason="manifest marks this model ineligible")
-            record["models"].append(row)
-            runs.atomic_json(out / "run.json", record)
-            print(f"  [{n}/{len(selected)}] {model}: skipped (ineligible)", flush=True)
-            continue
-
-        started = time.time()
-        row["started_utc"] = runs.utc()
-        tail = None
-        try:
-            building = build(model, ifc_path=str(Path(runs.ROOT) / entry["path"]),
-                             out_dir=str(out / "models" / model), verbose=False,
-                             threads=cfg["threads"], cell=cfg["cell"],
-                             min_room_area=cfg["min_room_area"], erode=cfg["erode"],
-                             cut_height=cfg['cut_height'], cut_thickness=cfg['cut_thickness'],
-                             band_base=cfg.get('band_base'),
-                             barrier_classes=tuple(cfg.get('barrier_classes') or BARRIERS),
-                             provenance=runs.model_provenance(record, entry))
-            error = None if building is not None else "no storeys found; nothing written"
-        except Exception as ex:
-            error = f"{type(ex).__name__}: {ex}"
-            tail = traceback.format_exc().strip().splitlines()[-4:]
-        row["elapsed_s"] = round(time.time() - started, 2)
-
-        if error:
-            row.update(status="failed", error=error,
-                       partial_output=(out / "models" / model).exists())
-            record["failures"].append({"model": model, "error": error,
-                                       **({"traceback_tail": tail} if tail else {})})
-        else:
-            row.update(status="completed", output_dir=f"models/{model}", **summarise(building))
-        record["models"].append(row)
-        runs.atomic_json(out / "run.json", record)
-        print(f"  [{n}/{len(selected)}] {model}: {row['status']}"
-              f"{' - ' + error if error else ''} ({row['elapsed_s']}s)", flush=True)
+    for _row, _result in runs.model_results(out, record, include_ineligible=args.include_ineligible):
+        pass
 
     runs.finish_run(out, record)
     counts = {}

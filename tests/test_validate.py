@@ -267,9 +267,24 @@ class ProjectionMeasures(unittest.TestCase):
         self.assertEqual(row["room_inference"]["storeys"][0]["inference_diagnostics"]["status"],
                          "no_barriers")
 
-    def test_incomplete_barrier_contour_fails_storey_without_dropping_references(self):
+    def test_a_wall_whose_cut_fails_stands_in_with_its_outline(self):
+        # the walls belong downstairs; one fails the upstairs cut, and its plan outline stands in
         data = self.fixture()
         data["elements"][-1]["_faces"] = data["elements"][-1]["_faces"][:-2]
+        row = self.validate_fixture(data)
+        rooms = row["room_inference"]
+        self.assertEqual(rooms["completion"], V.ratio(1, 1))
+        section = rooms["storeys"][0]["section_projection"]
+        self.assertEqual(section["excluded"], [])
+        self.assertEqual([f["step_id"] for f in section["fallbacks"]], [14])
+
+    def test_a_barrier_without_a_mesh_fails_storey_without_dropping_references(self):
+        # model_129's curtain walls have no mesh at all, so nothing can stand in for them: the
+        # storey fails, and its reference rooms stay in the denominator
+        data = self.fixture()
+        wall = data["elements"][-1]
+        del wall["_verts"], wall["_faces"]
+        wall["storey_step_id"] = 200
         row = self.validate_fixture(data)
         rooms = row["room_inference"]
         self.assertEqual(rooms["completion"], V.ratio(0, 1))
@@ -373,6 +388,15 @@ class ValidationRun(unittest.TestCase):
                                   env=dict(os.environ, PYTHONHASHSEED=str(seed)))
             self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
             results.append((out / "validation.json").read_bytes())
+        self.assertEqual(results[0], results[1])
+
+    def test_parallel_validation_preserves_results(self):
+        results = []
+        for workers in (1, 2):
+            out = self.ws/'results'/f'workers{workers}'
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(V.main(self.argv(out)+['--workers',str(workers)]), 0)
+            results.append((out/'validation.json').read_bytes())
         self.assertEqual(results[0], results[1])
 
     def test_failed_model_is_explicit_in_execution_denominator(self):

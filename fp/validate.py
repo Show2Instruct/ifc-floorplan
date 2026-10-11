@@ -4,8 +4,8 @@
 There is no ground-truth floor plan for these models, so the pipeline is checked against what the
 IFC file itself records. The quantity and held-out room checks use references that did not
 produce the values being compared. These are internal consistency checks, not accuracy against a
-surveyed building. docs/validation-metrics.md defines every measure: what is counted, what it is
-divided by, what is left out and what it cannot show.
+surveyed building. The document named in DEFINITIONS_DOC defines every measure: what is counted,
+what it is divided by, what is left out and what it cannot show.
 
   footprint_area       plan footprint against the declared footprint or slab area
   volume               footprint area x height against the declared volume
@@ -47,7 +47,7 @@ from fp.extract import extract, infer_rooms, storey_from_placement
 from fp.projections import BARRIERS, barrier_polygons, full_footprints, section_elements
 from fp.quantities import declared_quantity
 
-DEFINITIONS_VERSION = 5
+DEFINITIONS_VERSION = 6
 DEFINITIONS_DOC = "docs/validation-metrics.md"
 
 BARRIER = BARRIERS
@@ -482,6 +482,10 @@ def validate(path, settings):
                            "inference_failures": inference_failures,
                            "storeys_with_fallback_barriers": fallback_storeys,
                            "barrier_fallbacks": barrier_fallbacks,
+                           'planar_surface_approximations': sum(len(t['section_projection'].get(
+                               'planar_surface_approximations', [])) for t in storey_tests),
+                           'orientation_repairs': sum(len(t['section_projection'].get(
+                               'orientation_repairs', [])) for t in storey_tests),
                            "completion": ratio(len(storey_tests) - inference_failures, len(storey_tests)),
                            "storeys": storey_tests},
         "legacy_1_sep": {
@@ -618,6 +622,8 @@ def summarise(rows, area_errors, volume_errors):
             "storeys_with_fallback_barriers": sum(r["room_inference"].get("storeys_with_fallback_barriers", 0)
                                                   for r in rows),
             "barrier_fallbacks": sum(r["room_inference"].get("barrier_fallbacks", 0) for r in rows),
+            'planar_surface_approximations': sum(r['room_inference'].get('planar_surface_approximations', 0) for r in rows),
+            'orientation_repairs': sum(r['room_inference'].get('orientation_repairs', 0) for r in rows),
             "completion": pooled_ratio(rows, "room_inference", "completion"),
             "truth_rooms_on_failed_storeys": sum(t["n_truth"] for t in tests
                                                   if t["status"] == "failed"),
@@ -675,40 +681,15 @@ def main(argv=None):
 
     settings = record["settings"]
     rows, area_errors, volume_errors = [], [], []
-    for n, entry in enumerate(record["inputs"], 1):
-        model = entry["model"]
-        row = {"model": model, "input_ifc": entry["path"]}
-        if entry.get("quality_flags"):
-            row["quality_flags"] = entry["quality_flags"]
-        if entry.get("eligible") is False and not args.include_ineligible:
-            row.update(status="skipped", reason="manifest marks this model ineligible")
-            record["models"].append(row)
-            runs.atomic_json(out / "run.json", record)
-            print(f"  [{n}/{len(record['inputs'])}] {model}: skipped (ineligible)", flush=True)
-            continue
-        started = time.time()
-        tail = None
-        try:
-            result = validate(Path(runs.ROOT) / entry["path"], settings)
-            error = None if result is not None else "no storeys found; nothing validated"
-        except Exception as ex:
-            result, error = None, f"{type(ex).__name__}: {ex}"
-            tail = traceback.format_exc().strip().splitlines()[-4:]
-        row["elapsed_s"] = round(time.time() - started, 2)
-        if error:
-            row.update(status="failed", error=error)
-            record["failures"].append({"model": model, "error": error,
-                                       **({"traceback_tail": tail} if tail else {})})
-        else:
-            area_errors.extend(result.pop("_area_errors"))
-            volume_errors.extend(result.pop("_volume_errors"))
-            rows.append({"model": model, "input_ifc": entry["path"],
-                         "input_ifc_sha256": entry["ifc_sha256"], **result})
-            row["status"] = "completed"
-        record["models"].append(row)
-        runs.atomic_json(out / "run.json", record)
-        print(f"  [{n}/{len(record['inputs'])}] {model}: {row['status']}"
-              f"{' - ' + error if error else ''} ({row['elapsed_s']}s)", flush=True)
+    entries = {entry['model']: entry for entry in record['inputs']}
+    for row, result in runs.model_results(out, record, include_ineligible=args.include_ineligible):
+        if row['status'] == 'completed':
+            entry = entries[row['model']]
+            area_errors.extend(result.pop('_area_errors'))
+            volume_errors.extend(result.pop('_volume_errors'))
+            rows.append({'model': entry['model'], 'input_ifc': entry['path'],
+                         'input_ifc_sha256': entry['ifc_sha256'], **result})
+    rows.sort(key=lambda row: row['model'])
 
     summary = summarise(rows, area_errors, volume_errors)
     statuses = Counter(row["status"] for row in record["models"])

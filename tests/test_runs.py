@@ -144,6 +144,21 @@ class RunPipeline(unittest.TestCase):
         with_provenance.pop("provenance")
         self.assertEqual(with_provenance, json.loads((direct / "building.json").read_text()))
 
+    def test_parallel_execution_preserves_artifacts_and_failure_accounting(self):
+        manifest = self.manifest([self.row('0', self.ifc), self.row('bad', self.bad),
+            self.row('skip', self.ifc, eligible_for_structural_pipeline_pilot=False)])
+        results = []
+        for workers in (1, 2):
+            out = self.ws/'results'/f'workers{workers}'
+            self.assertEqual(self.run_cli('--manifest', manifest, '--dataset', 't', '--threads', 1,
+                                          '--workers', workers, '--out', out), 1)
+            record = json.loads((out/'run.json').read_text())
+            self.assertEqual(record['execution_workers'], workers)
+            self.assertEqual([(r['model'],r['status']) for r in record['models']],
+                             [('0','completed'),('bad','failed'),('skip','skipped')])
+            results.append(tree(out/'models'))
+        self.assertEqual(results[0], results[1])
+
     def test_refuses_unsafe_or_inconsistent_requests(self):
         runs_dir = self.ws / "results" / "runs"
         good = self.manifest([self.row("0", self.ifc, ifc_sha256=runs.sha256(self.ifc))])

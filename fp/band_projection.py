@@ -1,17 +1,18 @@
 """Project a mesh onto the plan after clipping it to a height band.
 
-The band is cut as a solid between two heights instead of intersecting a single plane, so
-vertical prisms keep their interiors and their holes. Lengths and tolerances are in metres.
+The band is cut as a solid between two heights instead of intersecting a single plane, so vertical
+prisms keep their interiors and their holes. A sheet with no thickness, such as a door panel
+modelled flat, is given a nominal one, clipped to the same band. Lengths and tolerances are in
+metres.
 """
 from __future__ import annotations
 
 import math
-
 import numpy as np
-from shapely.geometry import LineString, Polygon
+from shapely.geometry import LineString, Polygon, MultiPoint
 from shapely.ops import polygonize_full, unary_union
 
-from fp.extract import footprint, _union
+from fp.extract import footprint, _union, PLANAR_THICKNESS_M
 
 SNAP_M = 1e-6
 EPS_M = 1e-9
@@ -42,8 +43,8 @@ def clip_polygon(points, height, above):
 def plane_segment(triangle, height):
     """One oriented segment where a triangle crosses the plane.
 
-    Direction follows z cross face normal, so a solid with outward faces winds positively seen
-    from above and a cavity winds negatively. Coplanar faces contribute their projected area.
+        Direction follows z cross face normal, so a solid with outward faces winds positively seen
+        from above and a cavity winds negatively. Coplanar faces contribute their projected area.
     """
     if (triangle[:, 2].min() > height or triangle[:, 2].max() < height
             or np.all(triangle[:, 2] == height)):
@@ -72,9 +73,9 @@ def plane_segment(triangle, height):
 def cap_polygons(segments):
     """Close the cut contours into filled faces, using nonzero winding.
 
-    Parity cannot tell a cavity from a solid island sitting inside it. Face orientation can:
-    equal orientations add, opposite ones subtract. Mixed signs mean the source shells disagree,
-    so the caller is told rather than handed a cancelled-out hole.
+        Parity cannot tell a cavity from a solid island sitting inside it. Face orientation can:
+        equal orientations add, opposite ones subtract. Mixed signs mean the source shells disagree,
+        so the caller is told rather than handed a cancelled-out hole.
     """
     if not segments:
         return [], {'faces': 0, 'kept_faces': 0, 'cuts': 0, 'dangles': 0, 'invalid_rings': 0,
@@ -85,7 +86,7 @@ def cap_polygons(segments):
     info = {'faces': len(faces), 'cuts': len(cuts.geoms), 'dangles': len(dangles.geoms),
             'invalid_rings': len(invalid.geoms), 'fill_rule': 'nonzero_oriented_winding'}
     # Polygonizing nodes and merges the lines, which loses their direction and how many times
-    # they coincide, so count the winding from the original segments.
+    # they coincide, so the winding is counted from the original segments.
     edges = np.array([segment.coords for segment in segments], dtype=float)
     balance = {}
     for start, end in edges:
@@ -113,12 +114,14 @@ def cap_polygons(segments):
     return kept, info
 
 
-def plane_segments(vertices, faces, height, *, diagnostics=None):
+def plane_segments(vertices, faces, height, *, diagnostics=None, inside_above=None):
     """Every contour where the mesh crosses one plane.
 
-    An edge shared by a face above and a face below is a real cut even when neither face
-    crosses on its own. Edges that only touch the plane from one side are not. Snapped
-    coordinates also join vertices duplicated across separate face buffers.
+        An edge shared by a face above and a face below is a real cut even when neither face crosses
+        on its own; an edge that only touches the plane from one side is not. For a band's cap,
+        `inside_above` says which side of the bound is inside, so a face ending exactly at the cut
+        still bounds it. Coincident tangent edges running opposite ways cancel. Snapped coordinates
+        join vertices duplicated across separate face buffers.
     """
     segments, contact_edges = [], {}
     triangles = vertices[faces]
@@ -143,11 +146,16 @@ def plane_segments(vertices, faces, height, *, diagnostics=None):
                 counts[side].append(direction)
     inconsistent = 0
     for edge, sides in contact_edges.items():
+        if inside_above is not None:
+            winding = sum(sides[1 if inside_above else -1])
+            for _ in range(abs(winding)):
+                segments.append(LineString(edge if winding > 0 else edge[::-1]))
+            continue
         if not sides[-1] or not sides[1]:
             continue
-        # A real shared cut edge has matching directions on both sides. Keep the multiplicity
-        # for coincident shells, but count two faces meeting at one edge once. Opposite signs
-        # are a defect in the mesh.
+        # A real shared cut edge has matching directions on both sides. Keep the multiplicity for
+        # coincident shells, but count two faces meeting at one edge once. Opposite signs are a
+        # defect in the mesh.
         if sorted(sides[-1]) != sorted(sides[1]):
             inconsistent += 1
         for direction in sides[-1]:
@@ -157,12 +165,61 @@ def plane_segments(vertices, faces, height, *, diagnostics=None):
     return segments
 
 
-def project_band(vertices, faces, low, high):
+def orient_closed_mesh(vertices, faces):
+    """Make face winding consistent on one closed, connected surface.
+
+        Only the winding changes, never a vertex or a face. Separate shells are left alone, because
+        how they face each other is what tells a second solid from a cavity. Open or non-manifold
+        surfaces cannot be checked this way and are not touched.
+    """
+    if len(faces) > MAX_BAND_TRIANGLES:
+        return None
+    _, inverse = np.unique(vertices, axis=0, return_inverse=True)
+    canonical = inverse[faces]
+    edges = {}
+    for index, face in enumerate(canonical):
+        if len(set(face)) != 3:
+            return None
+        for a, b in zip(face, np.roll(face, -1)):
+            key = (min(a, b), max(a, b))
+            edges.setdefault(key, []).append((index, a < b))
+    if not edges or any(len(uses) != 2 for uses in edges.values()):
+        return None
+    neighbours = [[] for _ in faces]
+    for uses in edges.values():
+        (a, da), (b, db) = uses
+        neighbours[a].append((b, da == db))
+        neighbours[b].append((a, da == db))
+    flips, pending = {0: False}, [0]
+    while pending:
+        a = pending.pop()
+        for b, opposite in neighbours[a]:
+            flip = flips[a] ^ opposite
+            if b in flips:
+                if flips[b] != flip:
+                    return None
+            else:
+                flips[b] = flip
+                pending.append(b)
+    if len(flips) != len(faces):
+        return None
+    result = faces.copy()
+    # Reversing every face leaves a single solid's section unchanged, so keep the orientation
+    # most faces already have and edit as few as possible.
+    reverse = sum(flips.values()) > len(faces) / 2
+    for index, flip in flips.items():
+        if flip != reverse:
+            result[index] = result[index][::-1]
+    return result
+
+
+def project_band(vertices, faces, low, high, *, _repair_orientation=True):
     """Return (polygon, diagnostics) for the part of a mesh inside [low, high].
 
-    Bounds are inclusive, so a horizontal face resting on one of them contributes its area.
-    Nothing outside the band is substituted in. Where the cut contours do not close, the
-    result is no polygon and a reason, never a partial area.
+        Bounds are inclusive, so a horizontal face resting on one of them contributes its area.
+        Nothing outside the band is substituted in, and a mesh wholly inside the band reuses the
+        full-height projection. The triangle budget counts only triangles that reach the band. Where
+        the cut contours do not close, the result is no polygon and a reason, never a partial area.
     """
     vertices = np.asarray(vertices, dtype=float)
     faces = np.asarray(faces)
@@ -186,6 +243,10 @@ def project_band(vertices, faces, low, high):
     intersects = ((triangles[:, :, 2].max(axis=1) >= low - EPS_M)
                   & (triangles[:, :, 2].min(axis=1) <= high + EPS_M))
     relevant_faces = faces[intersects]
+    if not len(relevant_faces):
+        # One IFC element can hold separate solids, so its box can cross the band while none of its
+        # surfaces does.
+        return None, {'status': 'empty_band', 'source_triangles': len(faces), 'band_triangles': 0}
     # A sloping face can touch a bound along one edge, and floating point noise in the IFC can
     # put that edge a fraction of a nanometre inside the band. It has no plan area, so do not
     # report the tangent line as a broken cap.
@@ -214,12 +275,30 @@ def project_band(vertices, faces, low, high):
     if len(relevant_faces) > MAX_BAND_TRIANGLES:
         return None, {'status': 'unsupported_dense_cut', 'triangles': len(faces),
                       'band_triangles': len(relevant_faces), 'triangle_budget': MAX_BAND_TRIANGLES}
+    hull = MultiPoint(vertices[:, :2]).convex_hull
+    if hull.area <= SNAP_M * max(hull.length, SNAP_M):
+        # A flat vertical sheet has no solid cap to rebuild. Only its clipped triangles are
+        # thickened, never its whole outline, so separate parts and openings in it stay separate.
+        lines = []
+        for face in relevant_faces:
+            clipped = clip_polygon(clip_polygon(vertices[face], low, True), high, False)
+            if len(clipped) >= 2:
+                line = MultiPoint([p[:2] for p in clipped]).convex_hull
+                if line.length > SNAP_M:
+                    lines.append(line)
+        if lines:
+            result = unary_union(lines).buffer(PLANAR_THICKNESS_M / 2, cap_style=2)
+            if result.is_valid and not result.is_empty:
+                return result, {'status': 'sectioned_planar_surface', 'method': 'planar_buffered',
+                                'approximation': 'nominal_thickness_for_zero_thickness_surface',
+                                'nominal_thickness_m': PLANAR_THICKNESS_M,
+                                'source_triangles': len(faces), 'band_triangles': len(relevant_faces)}
     projected = []
     segments, segment_info = {}, {}
     for plane in (low, high):
         segment_info[plane] = {}
         segments[plane] = plane_segments(vertices, relevant_faces, plane,
-                                         diagnostics=segment_info[plane])
+                                         diagnostics=segment_info[plane], inside_above=plane == low)
     for face in relevant_faces:
         triangle = vertices[face]
         clipped = clip_polygon(clip_polygon(triangle, low, True), high, False)
@@ -242,6 +321,12 @@ def project_band(vertices, faces, low, high):
         return None, {'status': 'incomplete_cut_contours', **diagnostic}
     if any(info[key] for info in contours.values()
            for key in ('unbalanced_vertices', 'mixed_winding_signs', 'inconsistent_contact_edges')):
+        repaired = orient_closed_mesh(vertices, faces) if _repair_orientation else None
+        if repaired is not None and not np.array_equal(repaired, faces):
+            result, info = project_band(vertices, repaired, low, high, _repair_orientation=False)
+            if result is not None:
+                info['orientation_repair'] = 'consistent_winding_on_single_closed_connected_mesh'
+                return result, info
         return None, {'status': 'inconsistent_cut_orientation', **diagnostic}
     if not projected:
         return None, {'status': 'no_projected_area', **diagnostic}

@@ -403,6 +403,9 @@ def infer_rooms(barrier_polys, bounds, *, cell=0.12, min_area=1.5, erode=0, diag
 
 
 # main extraction
+HAIRLINE_M = .01    # half the widest joint between abutting barriers that growth may not pass
+
+
 def _to_wall_faces(poly, barriers, cell):
     """Put a rasterised room back on the wall faces it really has.
 
@@ -415,8 +418,18 @@ def _to_wall_faces(poly, barriers, cell):
         The region grows back past the pessimistic margin and is trimmed against the barriers
         themselves. Growth stops at the first real barrier, and where it crosses a thin partition the
         trim separates the pieces again and keeps the one the raster found.
+
+        Abutting barriers rarely meet exactly. A door leaf and its frame, or two walls at a joint,
+        leave gaps of a few millimetres, and growth passes through them onto the far face of the
+        wall: into the recess behind a door leaf, or along the outside of an external wall. There it
+        takes space from the room next door, and a door then has the same room on both sides. So
+        the grown region is opened by a hairline first, which cuts those necks and lets the pieces
+        separate like any other.
     """
     grown = poly.buffer(cell * 1.6).difference(barriers)
+    if grown.is_empty:
+        return poly
+    grown = grown.buffer(-HAIRLINE_M, join_style=2).buffer(HAIRLINE_M, join_style=2)
     if grown.is_empty:
         return poly
     if isinstance(grown, MultiPolygon):
@@ -539,6 +552,10 @@ def extract(path, *, verbose=False, threads=4):
                             "via_opening": o, "source_of_truth": "IfcRelVoids/FillsElement"})
         except Exception:
             pass
+    # every opening and the element it is cut through, filled or not: an archway or a hatch is a
+    # hole in its wall that no door or window closes
+    for o, h in o2h.items():
+        rel.append({"type": "voids", "source": h, "target": o, "source_of_truth": "IfcRelVoidsElement"})
     for r in f.by_type("IfcRelAggregates"):
         try:
             p = r.RelatingObject

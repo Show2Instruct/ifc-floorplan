@@ -23,6 +23,59 @@ def vertical_walls(rings, bottom=0., top=3.):
 
 
 class BandProjection(unittest.TestCase):
+    def test_empty_height_gap_between_disconnected_solids_is_not_a_failure(self):
+        lower, a = vertical_walls([[(0,0),(2,0),(2,1),(0,1)]], 0., 1.)
+        upper, b = vertical_walls([[(0,0),(2,0),(2,1),(0,1)]], 3., 4.)
+        faces = a + [tuple(i+len(lower) for i in f) for f in b]
+        polygon, info = project_band(np.vstack([lower,upper]), faces, 1.5, 2.)
+        self.assertIsNone(polygon)
+        self.assertEqual(info['status'], 'empty_band')
+
+    def test_planar_surface_buffers_only_the_clipped_region(self):
+        # Sloped sheet in the vertical x/z plane: whole footprint x=0..4,
+        # but the selected height band only occupies x=1..2.
+        vertices = np.array([(0,0,0),(4,0,4),(4,0,5),(0,0,1)], dtype=float)
+        polygon, info = project_band(vertices, [(0,1,2),(0,2,3)], 2., 2.01)
+        self.assertEqual(info['status'], 'sectioned_planar_surface')
+        self.assertEqual(info['method'], 'planar_buffered')
+        self.assertAlmostEqual(polygon.bounds[0], 1.)
+        self.assertAlmostEqual(polygon.bounds[2], 2.01)
+        self.assertAlmostEqual(polygon.area, 1.01 * info['nominal_thickness_m'])
+
+    def test_closed_connected_box_with_reversed_faces_is_repaired(self):
+        vertices, walls = vertical_walls([[(0,0),(2,0),(2,1),(0,1)]], 0., 3.)
+        faces = walls + [(0,2,1),(0,3,2),(4,5,6),(4,6,7)]
+        faces[0] = tuple(reversed(faces[0]))
+        polygon, info = project_band(vertices, faces, 1., 2.)
+        self.assertAlmostEqual(polygon.area, 2.)
+        self.assertIn('orientation_repair', info)
+
+    def test_disconnected_shells_with_conflicting_winding_are_not_guessed(self):
+        vertices, faces = vertical_walls([[(0,0),(2,0),(2,1),(0,1)],
+                                          [(3,0),(3,1),(5,1),(5,0)]])
+        polygon, info = project_band(vertices, faces, 1., 2.)
+        self.assertIsNone(polygon)
+        self.assertEqual(info['status'], 'inconsistent_cut_orientation')
+
+    def test_real_cut_at_horizontal_face_edge_uses_the_band_interior(self):
+        import ifcopenshell
+        import ifcopenshell.geom
+        settings = ifcopenshell.geom.settings()
+        settings.set('use-world-coords', True)
+        for model, sid, low in [('model_112', 78100, 5.6), ('model_13', 1359, 5.5)]:
+            path = Path(__file__).resolve().parents[2] / f'data/gni-bim/2025_BIMfundamentals/{model}.ifc'
+            if not path.exists():
+                self.skipTest('local IFC regression input unavailable')
+            source = ifcopenshell.open(str(path))
+            mesh = ifcopenshell.geom.create_shape(settings, source.by_id(sid))
+            vertices = np.array(mesh.geometry.verts).reshape(-1,3)
+            faces = np.array(mesh.geometry.faces).reshape(-1,3)
+            polygon, info = project_band(vertices, faces, low, low+.01)
+            interior, _ = project_band(vertices, faces, low+1e-6, low+.01)
+            self.assertEqual(info['status'], 'clipped_band', info)
+            self.assertTrue(polygon.is_valid)
+            self.assertLess(polygon.symmetric_difference(interior).area, 1e-4)
+
     def test_inside_prism_band_has_filled_cap_not_only_thin_edges(self):
         vertices, faces = vertical_walls([[(0,0),(4,0),(4,3),(0,3)]])
         polygon, info = project_band(vertices, faces, 1., 2.)
